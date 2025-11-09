@@ -41,6 +41,7 @@ This project automatically deploys a simple static website (`index.html` + `samp
 ├── terraform_apply_and_write_inventory.sh
 ├── user_data.sh
 └── variables.tf
+└── nagios.yml
 ```
 
 ---
