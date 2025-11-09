@@ -1,0 +1,75 @@
+---
+- hosts: web
+  become: true
+  vars:
+    web_root: /var/www/html
+  tasks:
+    - name: Gather minimal facts
+      setup:
+        gather_subset:
+          - min
+
+    - name: Install Apache (Debian/Ubuntu)
+      apt:
+        name: apache2
+        state: present
+        update_cache: yes
+      when: ansible_facts['os_family'] == "Debian"
+
+    - name: Install Apache (RedHat)
+      yum:
+        name: httpd
+        state: present
+      when: ansible_facts['os_family'] == "RedHat"
+
+    - name: Ensure web root exists
+      file:
+        path: "{{ web_root }}"
+        state: directory
+        owner: "{{ 'www-data' if ansible_facts['os_family'] == 'Debian' else 'apache' }}"
+        group: "{{ 'www-data' if ansible_facts['os_family'] == 'Debian' else 'apache' }}"
+        mode: '0755'
+
+    - name: Deploy index.html
+      copy:
+        src: ./index.html
+        dest: "{{ web_root }}/index.html"
+        owner: "{{ 'www-data' if ansible_facts['os_family'] == 'Debian' else 'apache' }}"
+        group: "{{ 'www-data' if ansible_facts['os_family'] == 'Debian' else 'apache' }}"
+        mode: '0644'
+
+    - name: Deploy sample_status.html
+      copy:
+        src: ./sample_status.html
+        dest: "{{ web_root }}/sample_status.html"
+        owner: "{{ 'www-data' if ansible_facts['os_family'] == 'Debian' else 'apache' }}"
+        group: "{{ 'www-data' if ansible_facts['os_family'] == 'Debian' else 'apache' }}"
+        mode: '0644'
+
+    - name: Enable and start Apache (Debian)
+      service:
+        name: apache2
+        enabled: yes
+        state: started
+      when: ansible_facts['os_family'] == "Debian"
+
+    - name: Enable and start httpd (RedHat)
+      service:
+        name: httpd
+        enabled: yes
+        state: started
+      when: ansible_facts['os_family'] == "RedHat"
+
+    - name: Wait for HTTP 200 on /index.html
+      uri:
+        url: "http://{{ ansible_host }}/index.html"
+        status_code: 200
+        timeout: 10
+      register: check_http
+      retries: 6
+      delay: 5
+      until: check_http.status == 200
+
+    - name: Show HTTP response status
+      debug:
+        msg: "HTTP check returned {{ check_http.status }}"
