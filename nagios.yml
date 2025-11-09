@@ -1,0 +1,196 @@
+---
+- hosts: web
+  become: true
+  vars:
+    nagios_version: "4.5.7"
+    nagios_admin_user: "nagiosadmin"
+    nagios_admin_pass: "nagiospassword"
+    # Automatically detect EC2 public IP or fallback to localhost
+    web_host_ip: "{{ hostvars[inventory_hostname]['ansible_host'] | default('127.0.0.1') }}"
+
+  tasks:
+
+    - name: Install required packages
+      apt:
+        name:
+          - wget
+          - unzip
+          - apache2
+          - php
+          - libapache2-mod-php
+          - build-essential
+          - libgd-dev
+          - openssl
+          - libssl-dev
+          - daemon
+          - sendmail
+          - monitoring-plugins
+        state: present
+        update_cache: yes
+
+    - name: Download Nagios Core source
+      get_url:
+        url: "https://github.com/NagiosEnterprises/nagioscore/releases/download/nagios-{{ nagios_version }}/nagios-{{ nagios_version }}.tar.gz"
+        dest: /tmp/nagios.tar.gz
+
+    - name: Extract Nagios Core source
+      unarchive:
+        src: /tmp/nagios.tar.gz
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Compile and install Nagios Core
+      shell: |
+        cd /tmp/nagios-{{ nagios_version }}
+        ./configure --with-httpd-conf=/etc/apache2/sites-enabled
+        make all
+        make install-groups-users
+        make install
+        make install-daemoninit
+        make install-commandmode
+        make install-config
+        make install-webconf
+        a2enmod rewrite cgi
+      args:
+        executable: /bin/bash
+
+    - name: Create Nagios admin user
+      shell: htpasswd -b -c /usr/local/nagios/etc/htpasswd.users {{ nagios_admin_user }} {{ nagios_admin_pass }}
+      args:
+        creates: /usr/local/nagios/etc/htpasswd.users
+
+    - name: Add webserver host/service config for monitoring
+      copy:
+        dest: /usr/local/nagios/etc/objects/webserver.cfg
+        content: |
+          define host {
+              use                     linux-server
+              host_name               demo-web
+              alias                   Demo Web Server
+              address                 {{ web_host_ip }}
+              max_check_attempts      3
+              check_period            24x7
+              notification_interval   30
+              notification_period     24x7
+          }
+
+          define service {
+              use                     generic-service
+              host_name               demo-web
+              service_description     HTTP Check for Demo Site
+              check_command           check_http!/
+          }
+
+    - name: Include new webserver.cfg file in Nagios main config
+      lineinfile:
+        path: /usr/local/nagios/etc/nagios.cfg
+        line: 'cfg_file=/usr/local/nagios/etc/objects/webserver.cfg'
+        insertafter: EOF
+
+    - name: Validate Nagios configuration
+      shell: /usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg
+      register: nagios_validate
+      changed_when: false
+      failed_when: "'Things look okay' not in nagios_validate.stdout"
+
+    - name: Ensure Nagios and nagcmd users/groups exist
+      shell: |
+        id -u nagios &>/dev/null || useradd -m nagios
+        getent group nagcmd || groupadd nagcmd
+        usermod -aG nagcmd nagios
+        usermod -aG nagcmd www-data
+        mkdir -p /usr/local/nagios/var/rw
+        chown -R nagios:nagcmd /usr/local/nagios
+        chmod -R 775 /usr/local/nagios/var /usr/local/nagios/var/rw /usr/local/nagios/etc
+
+    - name: Fix Nagios lock path to avoid systemd PID mismatch
+      file:
+        path: /run/nagios.lock
+        state: touch
+        owner: nagios
+        group: nagcmd
+        mode: '0664'
+
+    - name: Create systemd service for Nagios (fast + stable)
+      copy:
+        dest: /etc/systemd/system/nagios.service
+        content: |
+          [Unit]
+          Description=Nagios Core Monitoring Service
+          Documentation=https://www.nagios.org/documentation
+          After=network.target apache2.service
+
+          [Service]
+          Type=forking
+          GuessMainPID=no
+          PIDFile=/run/nagios.lock
+          ExecStartPre=/usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg
+          ExecStart=/usr/local/nagios/bin/nagios -d /usr/local/nagios/etc/nagios.cfg
+          ExecStop=/bin/kill -s TERM $MAINPID
+          ExecStopPost=/usr/bin/rm -f /usr/local/nagios/var/rw/nagios.cmd /usr/local/nagios/var/nagios.lock /run/nagios.lock
+          User=nagios
+          Group=nagcmd
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - Reload systemd
+
+    - name: Reload systemd
+      command: systemctl daemon-reload
+
+    - name: Enable Apache
+      service:
+        name: apache2
+        state: started
+        enabled: yes
+
+    - name: Enable Nagios service
+      systemd:
+        name: nagios
+        enabled: yes
+
+    - name: Configure Nagios web UI permissions
+      blockinfile:
+        path: /usr/local/nagios/etc/cgi.cfg
+        block: |
+          authorized_for_system_information=nagiosadmin
+          authorized_for_configuration_information=nagiosadmin
+          authorized_for_system_commands=nagiosadmin
+          authorized_for_all_services=nagiosadmin
+          authorized_for_all_hosts=nagiosadmin
+          authorized_for_read_only=nagiosadmin
+
+    - name: Restart Apache safely
+      service:
+        name: apache2
+        state: restarted
+
+    - name: Clean stale Nagios files before restart
+      shell: |
+        pkill -9 nagios || true
+        rm -f /usr/local/nagios/var/nagios.lock /run/nagios.lock /usr/local/nagios/var/rw/nagios.cmd
+      ignore_errors: yes
+
+    - name: Restart Nagios cleanly (ignore transient startup code)
+      shell: |
+        systemctl restart nagios || true
+        sleep 5
+        systemctl is-active nagios
+      register: nagios_restart
+      changed_when: false
+      failed_when: "'active' not in nagios_restart.stdout"
+
+    - name: Verify Nagios active status
+      shell: systemctl is-active nagios
+      register: nagios_status
+      retries: 6
+      delay: 5
+      until: nagios_status.stdout.find("active") != -1
+      failed_when: "'active' not in nagios_status.stdout"
+
+  handlers:
+    - name: Reload systemd
+      command: systemctl daemon-reload
